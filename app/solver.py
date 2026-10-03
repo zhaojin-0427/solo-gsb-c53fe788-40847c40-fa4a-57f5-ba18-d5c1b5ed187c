@@ -26,6 +26,11 @@ CP-SAT 规划。若大模型在 ``time_limit_seconds`` 内连一个可行解都�
 求解器会用免求解的构造性排列（严格遵守作业内层序、purge 经精确核算不
 超容）兜底，仍返回完整的计划 / 切换记录 / purge / 逾期明细，状态如实
 标记为 ``FEASIBLE``；构造性候选也超容时才返回 ``UNKNOWN``。
+
+构造性候选除整作业串行排列外，还包括按材料交错各作业同材料连续段的
+贪心排列：例如两个作业均按 A→B→A 用料、容量仅够两次换料时，串行至少
+换料四次必然超容，只有交错才能把 purge 压进容量（见
+:func:`_heuristic_orders`）。
 """
 
 from __future__ import annotations
@@ -491,6 +496,57 @@ def diagnose_infeasible(inst: Instance, time_limit: float) -> Tuple[str, dict]:
     )
 
 
+def _job_runs(jd: JobData) -> List[Tuple[str, List[int]]]:
+    """把作业的层段压缩为同材料连续段（run）：[(材料, [全局层段号...]), ...]。
+
+    run 是交错的最小单位：run 内部层段材料相同、顺序相连，整体移动既不
+    破坏作业内层序，也不会引入额外换料。
+    """
+    runs: List[Tuple[str, List[int]]] = []
+    for seg in jd.segments:
+        gi = seg["global_idx"]
+        mat = seg["material_id"]
+        if runs and runs[-1][0] == mat:
+            runs[-1][1].append(gi)
+        else:
+            runs.append((mat, [gi]))
+    return runs
+
+
+def _interleaved_order(inst: Instance, *, prefer_material: bool) -> List[int]:
+    """按 run 贪心交错各作业（严格遵守作业内层段顺序，因此必定合法）。
+
+    每一步在各作业的下一个就绪 run 中挑选一个整体执行：
+
+    * ``prefer_material=True``：优先不换料——只要有就绪 run 与当前材料相同
+      就只在其中选择（同材料连续打印，倾向减少换料 / purge），否则在全部
+      就绪 run 中选择；平局按 ``(截止时间, 作业 ID)``；
+    * ``prefer_material=False``：直接按 ``(截止时间, 作业 ID)`` 选择就绪
+      run（倾向降低逾期，可能增加换料）。
+
+    两种倾向分别代表"同材料连续打印"与"截止时间"之间的取舍，最终由
+    :func:`_feasible_heuristic` 按 (purge, 逾期, 字典序) 目标统一裁决。
+    """
+    runs_per_job = [_job_runs(jd) for jd in inst.jobs]
+    cursor = [0] * len(inst.jobs)
+    cur = inst.initial_material
+    order: List[int] = []
+    while True:
+        ready = [j for j, runs in enumerate(runs_per_job) if cursor[j] < len(runs)]
+        if not ready:
+            return order
+        pool = ready
+        if prefer_material:
+            same = [j for j in ready if runs_per_job[j][cursor[j]][0] == cur]
+            if same:
+                pool = same
+        j = min(pool, key=lambda k: (inst.jobs[k].deadline, inst.jobs[k].job_id))
+        mat, gis = runs_per_job[j][cursor[j]]
+        order.extend(gis)
+        cur = mat
+        cursor[j] += 1
+
+
 def _heuristic_orders(inst: Instance) -> List[List[int]]:
     """构造性候选排列（均严格遵守作业内层段顺序，因此必定合法）。
 
@@ -500,7 +556,15 @@ def _heuristic_orders(inst: Instance) -> List[List[int]]:
     * 输入作业顺序（作业内按层序，作业间不交错）；
     * 反向输入作业顺序；
     * 按截止时刻升序（EDD，倾向降低逾期）；
-    * 按作业 ID 升序（字典序倾向）。
+    * 按作业 ID 升序（字典序倾向）；
+    * 按材料交错的贪心排列（同材料连续打印，倾向减少换料 / purge）——
+      整作业串行必然频繁换料时（如两个作业均按 A→B→A 用料），串行候选
+      全部超容，只有交错才可能把 purge 压进容量；
+    * 按截止时间交错的贪心排列（倾向降低逾期）。
+
+    后两类候选在"同材料连续打印"与"截止时间"之间做了两种相反的取舍；
+    哪个更合适由 :func:`_feasible_heuristic` 按 (purge, 逾期, 字典序)
+    目标统一选择，与 CP-SAT 的目标优先级一致。
     """
     job_orders = [
         [jd for jd in inst.jobs],
@@ -510,12 +574,17 @@ def _heuristic_orders(inst: Instance) -> List[List[int]]:
     ]
     orders: List[List[int]] = []
     seen: set = set()
-    for jds in job_orders:
-        order = [seg["global_idx"] for jd in jds for seg in jd.segments]
+
+    def _add(order: List[int]) -> None:
         key = tuple(order)
         if key not in seen:
             seen.add(key)
             orders.append(order)
+
+    for jds in job_orders:
+        _add([seg["global_idx"] for jd in jds for seg in jd.segments])
+    _add(_interleaved_order(inst, prefer_material=True))
+    _add(_interleaved_order(inst, prefer_material=False))
     return orders
 
 

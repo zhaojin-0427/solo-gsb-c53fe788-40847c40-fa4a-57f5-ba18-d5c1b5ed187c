@@ -292,6 +292,57 @@ def test_long_job_capacity_infeasible_unchanged():
     assert d["plan"] == []
 
 
+# ------------------- 长作业按材料交错（A→B→A 用料） -------------------
+
+def test_interleave_short_limit_returns_full_plan():
+    """两作业均按 A→B→A 用料（单作业 25 段）：整作业串行至少换料 4 次，
+    按材料交错只需 2 次。初始材料 A、跨材料 purge 均为 1、容量 2 时只有
+    交错计划可行；短限时下 CP-SAT 未必找到解，构造性兜底也必须返回该
+    交错计划，不得误报 UNKNOWN + 空计划。"""
+    payload = load_example("request_interleave.json")
+    payload["time_limit_seconds"] = 0.1  # 极短限时，构造性兜底必须接管
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] in ("FEASIBLE", "OPTIMAL")
+    assert d["plan"], "交错可行时不允许返回空计划"
+    _assert_plan_consistent(d, {"J1": 25, "J2": 15})
+    # 容量 2 内恰好两次换料（A→B、B→A）：少于 2 次不可能，多于 2 次超容
+    assert d["purge_used_mm3"] == 2
+    assert d["purge_remaining_mm3"] == 0
+    assert [(s["from_material"], s["to_material"], s["purge_mm3"]) for s in d["switches"]] == [
+        ("A", "B", 1),
+        ("B", "A", 1),
+    ]
+    # 兜底仅证可行时标 FEASIBLE，绝不虚报最优
+    if d["status"] == "FEASIBLE":
+        assert d["optimal"] is False
+
+
+def test_interleave_example_default_limit():
+    """交错示例在默认限时下同样返回容量内的完整计划。"""
+    d = post(load_example("request_interleave.json")).json()
+    assert d["status"] in ("FEASIBLE", "OPTIMAL")
+    _assert_plan_consistent(d, {"J1": 25, "J2": 15})
+    assert d["purge_used_mm3"] == 2
+    assert d["total_tardiness_seconds"] == 0
+    assert [(s["from_material"], s["to_material"]) for s in d["switches"]] == [
+        ("A", "B"),
+        ("B", "A"),
+    ]
+
+
+def test_interleave_capacity_one_still_no_plan():
+    """容量 1 时交错也不够：必须 INFEASIBLE/UNKNOWN 且空计划，绝不输出超容计划。"""
+    payload = load_example("request_interleave.json")
+    payload["total_purge_capacity_mm3"] = 1
+    payload["time_limit_seconds"] = 3
+    d = post(payload).json()
+    assert d["status"] in ("INFEASIBLE", "UNKNOWN")
+    assert d["optimal"] is False
+    assert d["plan"] == []
+
+
 # ----------------------------- 422 校验 -----------------------------
 
 def test_422_cases():

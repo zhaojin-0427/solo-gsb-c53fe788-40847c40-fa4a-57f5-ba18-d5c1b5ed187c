@@ -239,9 +239,12 @@ curl -X POST http://localhost:8000/plans \
 - CP-SAT 已给出可行解但未完成最优性证明 → `FEASIBLE`，`objective` 中
   `purge_optimal` / `tardiness_optimal` / `lexicographic_minimal` 分别
   如实反映各级目标**是否确已证明**（可能 purge 已证最优而字典序未证明）；
-- CP-SAT 连可行解都未找到 → 服务用免求解的**构造性排列**兜底（严格遵守
-  作业内层段顺序，purge 经精确核算不超容），仍返回完整、按序的计划与全部
-  明细，状态为 `FEASIBLE`，且三个最优性标记均为 `false`；
+- CP-SAT 连可行解都未找到 → 服务用免求解的**构造性排列**兜底：除整作业
+  串行外，还把每个作业切成同材料连续段（run）并**按材料交错**，让不同
+  作业的同材料 run 相邻执行（两个均按 A→B→A 用料的作业，串行至少换料
+  4 次，按材料交错只需 2 次）。候选严格遵守作业内层段顺序，purge 经
+  精确核算，仅取不超容者并按（purge、逾期、字典序）择优，仍返回完整、
+  按序的计划与全部明细，状态为 `FEASIBLE`，且三个最优性标记均为 `false`；
 - 构造性候选也不满足 purge 容量（或确属容量无解）→ `UNKNOWN` /
   `INFEASIBLE`，此时 `plan` 为空，不会伪造计划。
 
@@ -254,6 +257,82 @@ curl -X POST http://localhost:8000/plans \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["objective"])'
 # OPTIMAL {'total_purge_mm3': 2320, ..., 'lexicographic_minimal': True}
 ```
+
+### 按材料交错的长作业（A→B→A 用料）
+
+`examples/request_interleave.json` 是需要跨作业交错才能满足容量的典型场景：
+两个 25 段长作业均按 A→B→A 用料（9 段 A、8 段 B、8 段 A，允许同材料连续
+多段），初始材料 A，跨材料 purge 均为 1 mm³，总容量仅 2 mm³：
+
+- **整作业串行**（J1 打完再打 J2）至少换料 4 次（每个作业 A→B→A 各 2 次），
+  purge 共 4 mm³，超出容量；
+- **按材料交错**——两作业的 A 段合流、B 段合流、再回到 A 段——只需
+  A→B、B→A 共 2 次换料，恰好不超容。
+
+启动服务并调用：
+
+```bash
+docker compose up --build -d
+
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_interleave.json
+```
+
+实际响应（`plan` 共 50 段，此处中间从略，其余字段与实际输出一致）：
+
+```json
+{
+  "status": "FEASIBLE",
+  "optimal": false,
+  "objective": {
+    "total_purge_mm3": 2,
+    "total_tardiness_seconds": 0,
+    "purge_optimal": true,
+    "tardiness_optimal": true,
+    "lexicographic_minimal": false
+  },
+  "plan": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "A",
+     "print_seconds": 10, "volume_mm3": 5, "start_seconds": 0, "end_seconds": 10},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "A",
+     "print_seconds": 10, "volume_mm3": 5, "start_seconds": 10, "end_seconds": 20},
+    ...
+    {"order": 49, "job_id": "J2", "segment_index": 24, "material_id": "A",
+     "print_seconds": 10, "volume_mm3": 5, "start_seconds": 484, "end_seconds": 494},
+    {"order": 50, "job_id": "J2", "segment_index": 25, "material_id": "A",
+     "print_seconds": 10, "volume_mm3": 5, "start_seconds": 494, "end_seconds": 504}
+  ],
+  "switches": [
+    {"order": 1, "from_material": "A", "to_material": "B", "purge_mm3": 1,
+     "switch_seconds": 2, "after_segment_order": 18, "at_seconds": 180},
+    {"order": 2, "from_material": "B", "to_material": "A", "purge_mm3": 1,
+     "switch_seconds": 2, "after_segment_order": 34, "at_seconds": 342}
+  ],
+  "job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 424, "deadline_seconds": 100000, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 504, "deadline_seconds": 100000, "tardy_seconds": 0}
+  ],
+  "purge_used_mm3": 2,
+  "purge_remaining_mm3": 0,
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 504,
+  "infeasible_reason": null,
+  "solver_message": "purge 与逾期均已证最优；字典序决胜在限时内未完全证明，返回当前最优目标值下的可行计划（不声称字典序最小）"
+}
+```
+
+结果解读：计划把两个作业的同材料连续段合并相邻——第 1～18 段为两作业的
+A 段、第 19～34 段为 B 段、第 35～50 段为 A 段——仅 2 次换料
+（A→B、B→A 各 1 mm³），purge 余量 0，两作业均按期完成。purge 与逾期
+已证最优；50 个位置的字典序决胜未在限时内全部证明，故 `status` 为
+`FEASIBLE` 而非 `OPTIMAL`（若证明完成则返回 `OPTIMAL`，计划内容不变）。
+
+用极短时限（如把请求中 `"time_limit_seconds"` 改为 `0.5`）调用同一请求时，
+CP-SAT 可能来不及给出任何解，服务改用免求解的构造性候选兜底：整作业串行
+候选 purge 为 4、全部超容被弃，按材料交错候选 purge 为 2 被选中，仍返回
+与上面相同的完整计划，`status` 为 `FEASIBLE` 且三个 `*_optimal` 标记均为
+`false`——不会误报 `UNKNOWN` 和空计划。
 
 ### 求解状态语义
 
@@ -299,9 +378,10 @@ curl -i -X POST http://localhost:8000/plans \
 ├── examples/
 │   ├── request.json              # 可行示例
 │   ├── request_long_job.json     # 长作业示例（单作业 25 段）
+│   ├── request_interleave.json   # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
 │   └── request_infeasible.json   # 容量超限示例
 ├── tests/
-│   └── test_plans.py  # 13 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   └── test_plans.py  # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -324,8 +404,11 @@ curl -i -X POST http://localhost:8000/plans \
 - 无解时临时移除容量上限再求最小 purge：仍无解归因为 `PRECEDENCE`，
   最小 purge 超出容量则归因为 `CAPACITY` 并给出最小需求值。
 - 层段数没有固定上限，长作业直接建模；大模型在 `time_limit_seconds` 内
-  未求得可行解时，用免求解的构造性排列（作业顺序、截止时间升序等候选）
-  兜底并精确核算 purge，仍返回完整、按序的计划与全部明细，状态如实标为
-  `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。三级目标的最优性
-  标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜的每一步可行性）
-  确已证明时才置为 `true`。
+  未求得可行解时，用免求解的构造性排列兜底：整作业串行（输入顺序、反向、
+  截止时间升序、作业 ID 升序）之外，还把每个作业切成同材料连续段（run）
+  并按材料交错——"同材料连续打印优先"与"截止时间优先"两种贪心在少换料与
+  少逾期之间取舍。全部候选严格遵守作业内层序、精确核算 purge 后仅取不超
+  容者，并按（purge、逾期、字典序）择优，仍返回完整、按序的计划与全部
+  明细，状态如实标为 `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。
+  三级目标的最优性标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜
+  的每一步可行性）确已证明时才置为 `true`。

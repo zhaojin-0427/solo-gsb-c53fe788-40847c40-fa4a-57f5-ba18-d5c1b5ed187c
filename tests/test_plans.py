@@ -5,7 +5,9 @@ import os
 
 from fastapi.testclient import TestClient
 
+from app import solver
 from app.main import app
+from app.schemas import PlanRequest
 
 client = TestClient(app)
 
@@ -290,6 +292,83 @@ def test_long_job_capacity_infeasible_unchanged():
     assert d["status"] in ("INFEASIBLE", "UNKNOWN")
     assert d["optimal"] is False
     assert d["plan"] == []
+
+
+# --------------------- 长作业按材料交错（A→B→A 用料） ---------------------
+
+def _aba_payload(time_limit: float = 15) -> dict:
+    """两个 25 段作业，均按 A→B→A 用料（9A + 8B + 8A），容量仅够 2 次换料。"""
+    segs = [
+        {"material_id": m, "print_seconds": 10, "volume_mm3": 5}
+        for m in ["A"] * 9 + ["B"] * 8 + ["A"] * 8
+    ]
+    return {
+        "jobs": [
+            {"job_id": "J1", "deadline_seconds": 100000, "segments": segs},
+            {"job_id": "J2", "deadline_seconds": 100000, "segments": [dict(s) for s in segs]},
+        ],
+        "initial_material": "A",
+        "purge_matrix": {"A": {"A": 0, "B": 1}, "B": {"A": 1, "B": 0}},
+        "switch_seconds": 2,
+        "total_purge_capacity_mm3": 2,
+        "time_limit_seconds": time_limit,
+    }
+
+
+def _assert_interleaved_aba_plan(d: dict) -> None:
+    """两作业 A→B→A 交错后：A 段合流 → B 段合流 → A 段合流，恰好 2 次换料。"""
+    _assert_plan_consistent(d, {"J1": 25, "J2": 25})
+    # 任何可行计划至少换料 2 次（每个作业的 B 段夹在 A 段之间），容量恰为 2
+    assert d["purge_used_mm3"] == 2
+    assert d["purge_remaining_mm3"] == 0
+    assert [(s["from_material"], s["to_material"], s["purge_mm3"]) for s in d["switches"]] == [
+        ("A", "B", 1),
+        ("B", "A", 1),
+    ]
+    mats = [p["material_id"] for p in d["plan"]]
+    assert mats == ["A"] * 18 + ["B"] * 16 + ["A"] * 16
+    assert d["total_tardiness_seconds"] == 0
+
+
+def test_interleave_example_file():
+    """示例文件：两个 25 段 A→B→A 作业按材料交错，2 次换料在容量 2 之内。"""
+    r = post(load_example("request_interleave.json"))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] in ("FEASIBLE", "OPTIMAL")
+    _assert_interleaved_aba_plan(d)
+
+
+def test_long_jobs_ab_runs_short_limit_not_unknown():
+    """回归：短限时下 CP-SAT 可能未得解，兜底不得只试串行而误报 UNKNOWN。
+
+    整作业串行至少换料 4 次（purge 4，超容 2），按材料交错只需 2 次；
+    必须返回按材料交错的完整计划（FEASIBLE 或已证 OPTIMAL），而非空计划。
+    """
+    r = post(_aba_payload(time_limit=0.5))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] in ("FEASIBLE", "OPTIMAL"), d["solver_message"]
+    assert d["plan"], "长作业 + 短限时不得再误报空计划"
+    _assert_interleaved_aba_plan(d)
+    if d["status"] == "FEASIBLE":
+        assert d["optimal"] is False
+
+
+def test_heuristic_candidates_include_material_interleaving():
+    """构造性候选本身（不经 CP-SAT）就必须包含按材料交错的低 purge 排列。"""
+    req = PlanRequest(**_aba_payload())
+    inst = solver.build_instance(req)
+    purges = [
+        solver._materialize(inst, order)["purge_used_mm3"]
+        for order in solver._heuristic_orders(inst)
+    ]
+    assert 4 in purges  # 整作业串行候选仍保留（换料 4 次，超容）
+    assert min(purges) == 2  # 新增按材料交错候选把换料压到 2 次
+    heur = solver._feasible_heuristic(inst)
+    assert heur is not None
+    _, timeline = heur
+    assert timeline["purge_used_mm3"] == 2  # 兜底选中不超容的交错计划
 
 
 # ----------------------------- 422 校验 -----------------------------

@@ -23,9 +23,14 @@
 
 层段数量没有固定上限，合法的长作业（如单作业 25 段以上）直接进入
 CP-SAT 规划。若大模型在 ``time_limit_seconds`` 内连一个可行解都找不到，
-求解器会用免求解的构造性排列（严格遵守作业内层序、purge 经精确核算不
-超容）兜底，仍返回完整的计划 / 切换记录 / purge / 逾期明细，状态如实
-标记为 ``FEASIBLE``；构造性候选也超容时才返回 ``UNKNOWN``。
+求解器会用免求解的构造性排列兜底：除整作业串行外，还会把每个作业切成
+同材料连续段（run）并按材料交错，让不同作业的同材料 run 相邻执行——
+整作业串行在同材料可跨作业合并时换料次数虚高（例如两作业均按
+A→B→A 用料时，串行至少换料 4 次，按材料交错只需 2 次），只试串行
+会把本可满足 purge 容量的请求误报为 UNKNOWN。候选均严格遵守作业内
+层序，purge 经精确核算，仅取不超容者并按 (purge, 逾期, 字典序) 择优，
+仍返回完整的计划 / 切换记录 / purge / 逾期明细，状态如实标记为
+``FEASIBLE``；构造性候选也超容时才返回 ``UNKNOWN``。
 """
 
 from __future__ import annotations
@@ -491,16 +496,91 @@ def diagnose_infeasible(inst: Instance, time_limit: float) -> Tuple[str, dict]:
     )
 
 
+def _job_runs(inst: Instance) -> List[List[List[int]]]:
+    """把每个作业切成同材料连续段（run）；run 内层段与 run 之间均保持原顺序。"""
+    runs_per_job: List[List[List[int]]] = []
+    for jd in inst.jobs:
+        runs: List[List[int]] = []
+        for seg in jd.segments:
+            gi = seg["global_idx"]
+            if runs and inst.material_of[runs[-1][-1]] == seg["material_id"]:
+                runs[-1].append(gi)
+            else:
+                runs.append([gi])
+        runs_per_job.append(runs)
+    return runs_per_job
+
+
+def _interleaved_orders(inst: Instance) -> List[List[int]]:
+    """run 级按材料交错的候选排列（严格遵守作业内层段顺序）。
+
+    整作业串行在同材料可跨作业合并时会付出大量本可避免的换料：两个
+    均按 A→B→A 用料的作业串行执行至少换料 4 次，而把同材料 run 合并
+    相邻（A 段合流 → B 段合流 → A 段合流）只需 2 次。这里用两种贪心
+    策略在"同材料尽量连续打印（省 purge）"与"先赶截止时间（省逾期）"
+    之间取舍，生成不同倾向的候选；最终由 :func:`_feasible_heuristic`
+    按 (purge, 逾期, 字典序) 统一核算择优。
+    """
+    jobs = inst.jobs
+    runs_per_job = _job_runs(inst)
+
+    def build(mode: str) -> List[int]:
+        pos = [0] * len(jobs)  # 每个作业下一个待排 run 的下标
+        cur = inst.initial_material
+        order: List[int] = []
+        remaining = sum(len(runs) for runs in runs_per_job)
+        while remaining:
+            avail = [j for j in range(len(jobs)) if pos[j] < len(runs_per_job[j])]
+
+            def mat(j: int) -> str:
+                return inst.material_of[runs_per_job[j][pos[j]][0]]
+
+            same = [j for j in avail if mat(j) == cur]
+            if mode == "edd":
+                # 截止优先：先赶截止最早作业的下一个 run，不惜因此换料
+                j = min(avail, key=lambda j: (jobs[j].deadline, jobs[j].job_id))
+            elif same:
+                # 同材料连续打印优先；多个同材料 run 间按 (截止, 作业 ID) 取舍
+                j = min(same, key=lambda j: (jobs[j].deadline, jobs[j].job_id))
+            else:
+                # 不得不换料：purge 最小者优先，再按 (截止, 作业 ID) 取舍
+                j = min(
+                    avail,
+                    key=lambda j: (
+                        int(inst.purge_matrix[cur][mat(j)]),
+                        jobs[j].deadline,
+                        jobs[j].job_id,
+                    ),
+                )
+            run = runs_per_job[j][pos[j]]
+            order.extend(run)
+            cur = mat(j)
+            pos[j] += 1
+            remaining -= 1
+        return order
+
+    orders: List[List[int]] = []
+    seen: set = set()
+    for mode in ("purge", "edd"):
+        order = build(mode)
+        key = tuple(order)
+        if key not in seen:
+            seen.add(key)
+            orders.append(order)
+    return orders
+
+
 def _heuristic_orders(inst: Instance) -> List[List[int]]:
     """构造性候选排列（均严格遵守作业内层段顺序，因此必定合法）。
 
     CP-SAT 在限时内可能连一个可行解都找不到（大模型 / 时限极短）。
     用这些免求解的排列作为兜底，保证 API 仍能返回完整计划：
 
-    * 输入作业顺序（作业内按层序，作业间不交错）；
-    * 反向输入作业顺序；
-    * 按截止时刻升序（EDD，倾向降低逾期）；
-    * 按作业 ID 升序（字典序倾向）。
+    * 整作业串行：输入作业顺序、反向输入顺序、截止时刻升序（EDD）、
+      作业 ID 升序；
+    * run 级按材料交错（见 :func:`_interleaved_orders`）：同材料连续段
+      跨作业合并相邻，避免串行候选在同材料可合并时换料次数虚高
+      （两作业均为 A→B→A 时串行至少 4 次换料、交错只需 2 次）。
     """
     job_orders = [
         [jd for jd in inst.jobs],
@@ -512,6 +592,11 @@ def _heuristic_orders(inst: Instance) -> List[List[int]]:
     seen: set = set()
     for jds in job_orders:
         order = [seg["global_idx"] for jd in jds for seg in jd.segments]
+        key = tuple(order)
+        if key not in seen:
+            seen.add(key)
+            orders.append(order)
+    for order in _interleaved_orders(inst):
         key = tuple(order)
         if key not in seen:
             seen.add(key)
